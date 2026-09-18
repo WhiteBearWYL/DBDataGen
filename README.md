@@ -20,6 +20,7 @@ Tables and columns are defined entirely in SQL, with additional extensions embed
 
 Supported table-level feature:
 - `SIZE = N` — number of rows to generate
+- `SIZE = <n><unit>` — target output size, unit in `B`/`KB`/`MB`/`GB`/`TB` (e.g. `SIZE = 1GB`, `SIZE = 10GB`, `SIZE = 2.5MB`). The generator estimates the average row size by sampling and then streams rows until the file reaches the target size (typical deviation < 1%). Both forms can be mixed across tables in the same file.
 
 Supported column-level features:
 - `AUTO_INCREMENT`
@@ -41,6 +42,8 @@ Before row generation, the system **precomputes global plans** for:
 
 - Distributions (HISTOGRAM / NORMAL / POISSON)
 - Skewed columns
+
+Plans are applied in a **streaming** fashion, so exact-ratio / exact-skew semantics are preserved regardless of table size.
 
 This guarantees:
 - Exact ratio control for histograms
