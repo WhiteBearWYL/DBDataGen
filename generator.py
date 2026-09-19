@@ -4,6 +4,7 @@ import io
 import random
 import re
 import string
+import sys
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, getcontext
@@ -21,6 +22,10 @@ END_DATE: date = date(2099, 12, 31)
 # Default string length for STRING columns
 STRING_MIN_LENGTH: int = 1
 STRING_MAX_LENGTH: int = 100
+
+# Default datetime range for DATETIME / TIMESTAMP columns
+DATETIME_START: datetime = datetime(1999, 7, 10, 0, 0, 0)
+DATETIME_END: datetime = datetime(2099, 12, 31, 23, 59, 59)
 
 # Byte units supported in "SIZE = <n><unit>"
 SIZE_UNITS: Dict[str, int] = {
@@ -68,8 +73,13 @@ class Column:
         self.attrs: str = attrs  # AUTO_INCREMENT, SKEW, RANGE, SET, RULER, NOT NULL, ...
         self.max_length: Optional[int] = self._parse_length()
         self.skew_p: Optional[float] = self._parse_skew()  # SKEW(p)
+        self.nullable_p: Optional[float] = self._parse_nullable()  # NULLABLE(p)
         self.decimal_spec: Optional[Tuple[int, int]] = self._parse_decimal()  # DECIMAL(p,s)
         self.distribution: Optional[Dict[str, Any]] = self._parse_distribution()
+        self.time_fsp: Optional[int] = self._parse_fsp()  # DATETIME(n) / TIMESTAMP(n)
+        self.auto_start: Optional[int] = self._parse_auto_start()  # AUTO_INCREMENT START(n)
+        self.ruler_id: Optional[str] = self._parse_ruler_id()  # RULERID("$@...")
+        self.pair_fk: Optional[Tuple[str, str]] = self._parse_pair_fk()  # PAIRFK(col, pcol)
 
     def _parse_length(self) -> Optional[int]:
         """Parse VARCHAR/CHAR length from the attribute line."""
@@ -80,6 +90,31 @@ class Column:
         """Parse SKEW(p) value from the attribute line."""
         m = re.search(r"SKEW\(([\d.]+)\)", self.attrs)
         return float(m.group(1)) if m else None
+
+    def _parse_nullable(self) -> Optional[float]:
+        """Parse NULLABLE(p) probability of a NULL value from the attribute line."""
+        m = re.search(r"NULLABLE\(([\d.]+)\)", self.attrs)
+        return float(m.group(1)) if m else None
+
+    def _parse_fsp(self) -> Optional[int]:
+        """Parse fractional-seconds precision from DATETIME(n) / TIMESTAMP(n)."""
+        m = re.search(r"(DATETIME|TIMESTAMP)\s*\((\d+)\)", self.attrs, re.I)
+        return int(m.group(2)) if m else None
+
+    def _parse_auto_start(self) -> Optional[int]:
+        """Parse AUTO_INCREMENT START(n) offset."""
+        m = re.search(r"AUTO_INCREMENT\s+START\s*\((\d+)\)", self.attrs, re.I)
+        return int(m.group(1)) if m else None
+
+    def _parse_ruler_id(self) -> Optional[str]:
+        """Parse RULERID(\"template\") whose '$' is filled with this row's PK value."""
+        m = re.search(r'RULERID\("(.+?)"\)', self.attrs, re.I)
+        return m.group(1) if m else None
+
+    def _parse_pair_fk(self) -> Optional[Tuple[str, str]]:
+        """Parse PAIRFK(fk_col, parent_col): reuse the parent row sampled by fk_col."""
+        m = re.search(r"PAIRFK\(\s*`?(\w+)`?\s*,\s*`?(\w+)`?\s*\)", self.attrs, re.I)
+        return (m.group(1), m.group(2)) if m else None
 
     def _parse_decimal(self) -> Optional[Tuple[int, int]]:
         """
@@ -291,6 +326,53 @@ def rand_date(start: date = START_DATE, end: date = END_DATE) -> date:
     return start + timedelta(days=random.randint(0, delta))
 
 
+def rand_datetime(
+    start: datetime = DATETIME_START,
+    end: datetime = DATETIME_END,
+    fsp: Optional[int] = None,
+) -> str:
+    """
+    Generate a random datetime within [start, end], formatted for SQL/CSV.
+
+    Args:
+        start: Start datetime (inclusive).
+        end: End datetime (inclusive).
+        fsp: Fractional-seconds precision (0-6). When None or 0, seconds are
+             integer; otherwise microseconds are truncated to fsp digits.
+
+    Returns:
+        A formatted datetime string (e.g. "2022-09-28 13:09:00" or
+        "2022-09-28 13:09:00.123456").
+    """
+    delta_seconds = int((end - start).total_seconds())
+    dt = start + timedelta(seconds=random.randint(0, max(delta_seconds, 0)))
+    base = dt.strftime("%Y-%m-%d %H:%M:%S")
+    if fsp and fsp > 0:
+        frac = random.randint(0, 10**fsp - 1)
+        base += f".{frac:0{fsp}d}"
+    return base
+
+
+def parse_timerange(attrs: str) -> Optional[Tuple[datetime, datetime]]:
+    """
+    Parse TIMERANGE("start", "end") from the attribute line.
+
+    Args:
+        attrs: Column definition line.
+
+    Returns:
+        A tuple (start, end) datetime, or None if not present.
+    """
+    m = re.search(r'TIMERANGE\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)', attrs, re.I)
+    if not m:
+        return None
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return (
+        datetime.strptime(m.group(1), fmt),
+        datetime.strptime(m.group(2), fmt),
+    )
+
+
 def apply_ruler(rule: str, max_len: int) -> str:
     """
     Apply a RULER template to generate a string.
@@ -354,12 +436,14 @@ def generate_base_value(col: Column) -> Any:
     Generate a base value for a column according to its constraints.
 
     Supported constraints / extensions:
-    - RANGE(min,max) for numeric types (INT/FLOAT/DOUBLE/DECIMAL)
+    - RANGE(min,max) for integer / numeric types
+    - TIMERANGE("start","end") for DATETIME/TIMESTAMP
     - DECIMAL(p,s)
     - SET(...)
     - RULER("...$...")
     - VARCHAR/CHAR/TEXT/BLOB random strings
-    - DATE random date (ISO format string)
+    - DATE / DATETIME / TIMESTAMP random values
+    - Integer family: TINYINT / SMALLINT / MEDIUMINT / INT / BIGINT
 
     Args:
         col: Column metadata.
@@ -389,11 +473,25 @@ def generate_base_value(col: Column) -> Any:
         val = random.uniform(min_v, max_v)
         return round(val, 6 if col.type == "FLOAT" else 10)
 
-    # ---------- INT ----------
-    if col.type.startswith("INT"):
+    # ---------- INTEGER FAMILY ----------
+    int_bounds: Dict[str, Tuple[int, int]] = {
+        "TINYINT": (0, 1),
+        "SMALLINT": (-32768, 32767),
+        "MEDIUMINT": (-8388608, 8388607),
+        "INT": (-2147483648, 2147483647),
+        "INTEGER": (-2147483648, 2147483647),
+        "BIGINT": (-9223372036854775808, 9223372036854775807),
+    }
+    int_type = "INT" if col.type.startswith("INT") else col.type
+    if int_type in int_bounds:
+        type_lo, type_hi = int_bounds[int_type]
         if rng:
-            return random.randint(int(float(rng.group(1))), int(float(rng.group(2))))
-        return random.randint(1, 10000)
+            lo = max(int(float(rng.group(1))), type_lo)
+            hi = min(int(float(rng.group(2))), type_hi)
+            return random.randint(lo, hi)
+        if int_type == "TINYINT":
+            return random.randint(0, 1)
+        return random.randint(max(type_lo, 1), min(type_hi, 10000))
 
     # ---------- SET ----------
     st = re.search(r"SET\((.*?)\)", line)
@@ -418,8 +516,20 @@ def generate_base_value(col: Column) -> Any:
     if col.type.startswith(("TEXT", "BLOB")):
         return rand_string()
 
+    # ---------- DATETIME / TIMESTAMP ----------
+    if col.type in {"DATETIME", "TIMESTAMP"}:
+        trange = parse_timerange(line)
+        if trange:
+            start_dt, end_dt = trange
+        else:
+            start_dt, end_dt = DATETIME_START, DATETIME_END
+        return rand_datetime(start_dt, end_dt, col.time_fsp)
+
     # ---------- DATE ----------
     if col.type == "DATE":
+        drange = parse_timerange(line)
+        if drange:
+            return rand_date(drange[0].date(), drange[1].date()).isoformat()
         return rand_date().isoformat()
 
     return None
@@ -435,27 +545,61 @@ class HistogramPlan:
     while their positions remain uniformly shuffled.
     """
 
-    def __init__(self, col: Column, weights: Dict[Any, float], n_rows: int) -> None:
+    def __init__(
+        self,
+        col: Column,
+        weights: Dict[Any, float],
+        n_rows: int,
+        fallback_sampler: Optional[Any] = None,
+    ) -> None:
         """
         Args:
             col: Column metadata (used to generate fallback values).
             weights: Mapping value -> ratio from the HISTOGRAM spec.
             n_rows: Total number of rows to generate.
+            fallback_sampler: Optional zero-argument callable returning a
+                              fallback value (e.g. parent FK sampler). When
+                              None, values are generated from the column.
 
         Raises:
             ValueError: If the rounded quotas exceed n_rows (ratios sum > 1.0).
         """
         self.col = col
-        self.quotas: Dict[Any, int] = {}
-        for value, ratio in weights.items():
-            count = int(round(ratio * n_rows))
-            if count > 0:
-                self.quotas[value] = count
+        self.fallback_sampler = fallback_sampler
 
-        total = sum(self.quotas.values())
-        if total > n_rows:
+        # Validate the ratio total independently of rounding. Independent
+        # round() calls can overshoot by 1 even when ratios sum to exactly 1.0
+        # (e.g. 0.7/0.3 with an odd n), so quotas are allocated with the
+        # largest-remainder method rather than per-key rounding.
+        sum_ratios = float(sum(weights.values()))
+        if sum_ratios > 1.0 + 1e-9:
             raise ValueError(f"HISTOGRAM ratios exceed 1.0 on column {col.name}")
 
+        exact_counts = [(value, ratio * n_rows) for value, ratio in weights.items()]
+        floors = {value: int(exact) for value, exact in exact_counts}
+        fractions = {value: exact - floors[value] for value, exact in exact_counts}
+
+        # Number of explicit (non-fallback) slots after rounding the ratio sum.
+        quota_target = min(n_rows, int(sum_ratios * n_rows + 0.5))
+        remainder_slots = quota_target - sum(floors.values())
+
+        # Hand the remaining slots to keys with the largest fractional parts.
+        order = sorted(
+            weights.keys(),
+            key=lambda v: (-fractions[v], list(weights.keys()).index(v)),
+        )
+        allocated = dict(floors)
+        for value in order:
+            if remainder_slots <= 0:
+                break
+            allocated[value] += 1
+            remainder_slots -= 1
+
+        self.quotas: Dict[Any, int] = {
+            value: count for value, count in allocated.items() if count > 0
+        }
+
+        total = sum(self.quotas.values())
         self.total_quota: int = total
         self.remaining_rows: int = n_rows
         self.keys: Set[Any] = set(weights.keys())
@@ -497,9 +641,22 @@ class HistogramPlan:
 
     def _fallback(self) -> Any:
         """Generate a value that does not collide with explicit histogram keys."""
-        value = generate_base_value(self.col)
+
+        def non_key_value() -> Any:
+            if self.fallback_sampler is not None:
+                return self.fallback_sampler()
+            return generate_base_value(self.col)
+
+        value = non_key_value()
+        attempts = 0
         while value in self.keys:
-            value = generate_base_value(self.col)
+            attempts += 1
+            if attempts > 1000:
+                raise ValueError(
+                    f"HISTOGRAM keys on column {self.col.name} cover the whole "
+                    "value domain; make the ratios sum to 1.0 or reduce the keys."
+                )
+            value = non_key_value()
         return value
 
 
@@ -657,11 +814,105 @@ def build_skew_hots(
     return hots
 
 
+def sample_parent_pk(
+    fk_ctx: Dict[str, Any],
+    parent_table: str,
+    parent_pk_col: str,
+) -> Any:
+    """
+    Sample a parent primary-key value from the parent's FULL key domain.
+
+    Unlike the bounded row reservoir, this covers every parent PK, so large
+    child tables can draw far more distinct foreign keys than RESERVOIR_SIZE.
+
+    Args:
+        fk_ctx: Parent context built by generate_csv (keys: domains, pinned).
+        parent_table: Parent table name.
+        parent_pk_col: Parent's single primary-key column name.
+
+    Returns:
+        A parent PK value (native type).
+
+    Raises:
+        KeyError: If the parent has no stored single-column PK domain.
+    """
+    domain = fk_ctx["domains"][(parent_table, parent_pk_col)]
+    return random.choice(domain)
+
+
+def _rebuild_rulerid(template: str, pk_value: Any) -> str:
+    """Fill a deterministic RULERID template with the given PK value."""
+    return template.replace("$", str(pk_value))
+
+
+def resolve_paired_value(
+    fk_ctx: Dict[str, Any],
+    parent_table: str,
+    parent_pk_col: str,
+    fk_value: Any,
+    parent_col: str,
+) -> Any:
+    """
+    Resolve a parent-column value paired with an already-chosen FK value.
+
+    Lookup order:
+      1. Pinned complete rows (hot FK keys pinned from child histograms).
+      2. Lazily-built reservoir index (random non-hot keys that happen to be
+         inside the reservoir).
+      3. Deterministic rebuild: if the parent column is a single RULERID with
+         no NULLABLE, the value is a pure function of the parent PK.
+      4. Otherwise raise (the pairing cannot be resolved exactly).
+
+    Args:
+        fk_ctx: Parent context; carries pinned rows and a mutable cache dict.
+        parent_table: Parent table name.
+        parent_pk_col: Parent primary-key column referenced by the sibling FK.
+        fk_value: The parent PK value this row already drew.
+        parent_col: Parent column whose value is required.
+
+    Returns:
+        The paired parent-column value.
+    """
+    pinned = fk_ctx["pinned"].get(parent_table, {})
+    if fk_value in pinned:
+        return pinned[fk_value][parent_col]
+
+    # Asking for the parent's own PK column: value is the key itself.
+    if parent_col == parent_pk_col:
+        return fk_value
+
+    reservoir_rows = fk_ctx["reservoirs"].get(parent_table, [])
+    cache = fk_ctx.setdefault("res_index", {})
+    idx_key = (parent_table, parent_pk_col)
+    if idx_key not in cache:
+        cache[idx_key] = {r[parent_pk_col]: r for r in reservoir_rows}
+    row = cache[idx_key].get(fk_value)
+    if row is not None:
+        return row[parent_col]
+
+    # Deterministic rebuild from the parent column's RULERID template.
+    parent_table_meta = fk_ctx["table_meta"].get(parent_table)
+    if parent_table_meta is not None and parent_col in parent_table_meta.columns:
+        pcol = parent_table_meta.columns[parent_col]
+        if (
+            pcol.ruler_id is not None
+            and pcol.nullable_p is None
+        ):
+            return _rebuild_rulerid(pcol.ruler_id, fk_value)
+
+    raise KeyError(
+        f"Cannot pair parent column {parent_table}.{parent_col} for key "
+        f"{fk_value!r}; it is outside the reservoir and is not a deterministic "
+        "RULERID. Pin the key or make the column deterministic."
+    )
+
+
 def iter_table_rows(
     table: Table,
     n_rows: int,
     fk_samples: Dict[str, List[Dict[str, Any]]],
     skew_hots: Dict[str, Any],
+    fk_ctx: Optional[Dict[str, Any]] = None,
 ) -> Iterator[Dict[str, Any]]:
     """
     Stream rows for a single table.
@@ -692,13 +943,47 @@ def iter_table_rows(
     samplers: Dict[str, LazySampler] = {}
     skew_plans: Dict[str, SkewPlan] = {}
 
+    # Backwards-compatible default context when called without one (e.g. direct
+    # unit tests): fall back to reservoir-only sampling.
+    if fk_ctx is None:
+        fk_ctx = {
+            "domains": {},
+            "pinned": {},
+            "reservoirs": fk_samples,
+            "res_index": {},
+            "pk_cols": {},
+            "table_meta": {},
+        }
+
     for col_name, col in table.columns.items():
         is_single_pk = col_name in table.primary_key and len(table.primary_key) == 1
 
         dist = col.distribution
         if dist and not is_single_pk:
             if dist["type"] == "histogram":
-                hist_plans[col_name] = HistogramPlan(col, dist["weights"], n_rows)
+                # For a histogram on a foreign-key column, the non-hot remainder
+                # must still sample valid parent values. Prefer the parent's FULL
+                # key domain; fall back to the bounded reservoir if no domain is
+                # registered (standalone calls).
+                fk_info = next(
+                    (fk for fk in table.foreign_keys if fk[0] == col_name), None
+                )
+                fb_sampler = None
+                if fk_info:
+                    _, parent_table, parent_col = fk_info
+                    domain_key = (parent_table, parent_col)
+                    if domain_key in fk_ctx["domains"]:
+                        fb_sampler = (
+                            lambda dk=domain_key: sample_parent_pk(fk_ctx, dk[0], dk[1])
+                        )
+                    else:
+                        parent_rows = fk_samples[parent_table]
+                        fb_sampler = (
+                            lambda pr=parent_rows, pc=parent_col: random.choice(pr)[pc]
+                        )
+                hist_plans[col_name] = HistogramPlan(
+                    col, dist["weights"], n_rows, fb_sampler
+                )
             elif dist["type"] in ("normal", "poisson"):
                 samplers[col_name] = LazySampler(dist)
 
@@ -718,7 +1003,8 @@ def iter_table_rows(
         and "AUTO_INCREMENT" in table.columns[table.primary_key[0]].attrs
     )
     pk_seen: Set[Tuple[Any, ...]] = set()
-    auto_inc = 0
+    # Per-column AUTO_INCREMENT counters, optionally offset by START(n).
+    auto_inc: Dict[str, int] = {}
     attempt = 0
     max_attempts = n_rows * 10  # Prevent infinite loops
     generated = 0
@@ -735,8 +1021,17 @@ def iter_table_rows(
         for col_name, col in table.columns.items():
             # ---------- AUTO_INCREMENT ----------
             if "AUTO_INCREMENT" in col.attrs:
-                row[col_name] = auto_inc
-                auto_inc += 1
+                if col_name not in auto_inc:
+                    auto_inc[col_name] = col.auto_start or 0
+                row[col_name] = auto_inc[col_name]
+                auto_inc[col_name] += 1
+                continue
+
+            # ---------- NULLABLE(p) ----------
+            # Evaluated before consuming any distribution/skew plan slot, so a
+            # NULL row neither draws a plan value nor distorts the exact quotas.
+            if col.nullable_p is not None and random.random() < col.nullable_p:
+                row[col_name] = ""
                 continue
 
             # ---------- HISTOGRAM ----------
@@ -761,12 +1056,36 @@ def iter_table_rows(
                     row[col_name] = hot
                     continue
 
+            # ---------- PAIRFK ----------
+            # Reuse the parent row already sampled by the sibling FK column so
+            # paired fields (e.g. repo_id/repo_name) describe the same parent.
+            if col.pair_fk is not None:
+                fk_col, parent_col = col.pair_fk
+                sibling_fk = next(
+                    fk for fk in table.foreign_keys if fk[0] == fk_col
+                )
+                _, parent_table, sibling_parent_col = sibling_fk
+                row[col_name] = resolve_paired_value(
+                    fk_ctx,
+                    parent_table,
+                    sibling_parent_col,
+                    row[fk_col],
+                    parent_col,
+                )
+                continue
+
             # ---------- FOREIGN KEY ----------
             fk_info = next((fk for fk in table.foreign_keys if fk[0] == col_name), None)
             if fk_info:
                 _, parent_table, parent_col = fk_info
-                parent_rows = fk_samples[parent_table]
-                row[col_name] = random.choice(parent_rows)[parent_col]
+                domain_key = (parent_table, parent_col)
+                if domain_key in fk_ctx["domains"]:
+                    row[col_name] = sample_parent_pk(
+                        fk_ctx, parent_table, parent_col
+                    )
+                else:
+                    parent_rows = fk_samples[parent_table]
+                    row[col_name] = random.choice(parent_rows)[parent_col]
                 continue
 
             # ---------- BASE GENERATOR ----------
@@ -793,6 +1112,17 @@ def iter_table_rows(
             pk_seen.add(pk)
 
         generated += 1
+
+        # ---------- RULERID: fill templates using this row's PK value ----------
+        # Done after PK validation; for a single-column PK we substitute that
+        # value, so fields like email become "user<id>@example.test" and match
+        # the login workload predicates.
+        if len(table.primary_key) == 1:
+            pk_value = str(row[table.primary_key[0]])
+            for col_name, col in table.columns.items():
+                if col.ruler_id is not None:
+                    row[col_name] = col.ruler_id.replace("$", pk_value)
+
         yield row
 
     # ===================== Failure guard =====================
@@ -808,6 +1138,7 @@ def estimate_row_count(
     table: Table,
     fk_samples: Dict[str, List[Dict[str, Any]]],
     skew_hots: Dict[str, Any],
+    fk_ctx: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
     Estimate the number of rows needed to reach table.byte_target.
@@ -820,11 +1151,15 @@ def estimate_row_count(
         fk_samples: Parent table row reservoirs for FK sampling.
         skew_hots: Hot values for SKEW columns, shared with the real generation
                    pass to keep the estimated row size representative.
+        fk_ctx: Parent context (full domains / pinned rows); shared with the
+                real pass so sampled values have representative sizes.
 
     Returns:
         Estimated row count (>= 1).
     """
-    sample_rows = list(iter_table_rows(table, SAMPLE_ROWS, fk_samples, skew_hots))
+    sample_rows = list(
+        iter_table_rows(table, SAMPLE_ROWS, fk_samples, skew_hots, fk_ctx)
+    )
 
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=list(table.columns.keys()))
@@ -850,6 +1185,34 @@ def human_size(num_bytes: int) -> str:
     return f"{size:.1f}TB"
 
 
+def collect_pinned_keys(
+    tables: Dict[str, "Table"],
+) -> Dict[Tuple[str, str], Set[Any]]:
+    """
+    Pre-scan every table for FK HISTOGRAM hot keys that must stay resolvable.
+
+    Child workloads reference concrete hot parent keys (e.g. repo 41986369 or
+    actor 800000001). When generating the parent we pin the COMPLETE rows for
+    those keys so paired columns (PAIRFK) can be resolved even though the keys
+    are almost surely outside a bounded random reservoir.
+
+    Args:
+        tables: All parsed tables (schema-wide scan; child tables may appear
+                later in SQL order).
+
+    Returns:
+        Mapping (parent_table, parent_pk_col) -> set of pinned key values.
+    """
+    pinned: Dict[Tuple[str, str], Set[Any]] = {}
+    for child in tables.values():
+        for child_col, parent_table, parent_col in child.foreign_keys:
+            col = child.columns[child_col]
+            if col.distribution and col.distribution.get("type") == "histogram":
+                for key in col.distribution["weights"].keys():
+                    pinned.setdefault((parent_table, parent_col), set()).add(key)
+    return pinned
+
+
 def generate_csv(sql_file: Union[str, Path], out_dir: Optional[Union[str, Path]] = None) -> None:
     """
     Generate CSV files for all tables defined in the SQL file.
@@ -873,7 +1236,23 @@ def generate_csv(sql_file: Union[str, Path], out_dir: Optional[Union[str, Path]]
     output_dir = Path(out_dir) if out_dir is not None else Path(f"output_{CURRENT_TIME}")
     output_dir.mkdir(exist_ok=True)
 
+    # Pre-scan all children so that parent generation can pin hot FK keys.
+    pinned_keys = collect_pinned_keys(tables)
+
+    # State handed down to every iter_table_rows call.
     fk_samples: Dict[str, List[Dict[str, Any]]] = {}
+    pk_domains: Dict[Tuple[str, str], List[Any]] = {}
+    pinned_rows: Dict[str, Dict[Any, Dict[str, Any]]] = {}
+    pk_col_of: Dict[str, str] = {}
+
+    fk_ctx: Dict[str, Any] = {
+        "domains": pk_domains,
+        "pinned": pinned_rows,
+        "reservoirs": fk_samples,
+        "res_index": {},
+        "pk_cols": pk_col_of,
+        "table_meta": tables,
+    }
 
     for name, table in tables.items():
         # Hot values are sampled once and shared between the estimation pass
@@ -882,7 +1261,7 @@ def generate_csv(sql_file: Union[str, Path], out_dir: Optional[Union[str, Path]]
 
         # ---------- Resolve target row count ----------
         if table.byte_target is not None:
-            n_rows = estimate_row_count(table, fk_samples, skew_hots)
+            n_rows = estimate_row_count(table, fk_samples, skew_hots, fk_ctx)
             print(
                 f"[Info] {name}: target size {human_size(table.byte_target)}, "
                 f"estimated {n_rows} rows"
@@ -895,16 +1274,47 @@ def generate_csv(sql_file: Union[str, Path], out_dir: Optional[Union[str, Path]]
         reservoir: List[Dict[str, Any]] = []
         count = 0
 
+        # Track this table's single-column PK so its full domain can be exposed
+        # to child tables. A single auto-increment PK yields a dense range and
+        # is represented compactly as a NumPy array; otherwise we collect the
+        # PK of every emitted row.
+        single_pk = table.primary_key[0] if len(table.primary_key) == 1 else None
+        pk_is_autoincrement = (
+            single_pk is not None
+            and "AUTO_INCREMENT" in table.columns[single_pk].attrs
+        )
+        # Dense auto-increment start (defaults to 0 like the generator counter).
+        pk_start: Optional[int] = None
+        if pk_is_autoincrement:
+            pk_start = table.columns[single_pk].auto_start
+            if pk_start is None:
+                pk_start = 0
+
+        # Keys of this table that children require to be resolvable.
+        pin_targets = {
+            key
+            for (ptable, pcol), keys in pinned_keys.items()
+            if ptable == name and (single_pk is None or pcol == single_pk)
+            for key in keys
+        }
+        own_pinned: Dict[Any, Dict[str, Any]] = {}
+
         with open(output_dir / f"{name}.csv", "w", newline="", encoding="utf8") as f:
             writer = csv.DictWriter(f, fieldnames=list(table.columns.keys()))
             writer.writeheader()
 
-            for row in iter_table_rows(table, n_rows, fk_samples, skew_hots):
+            for row in iter_table_rows(
+                table, n_rows, fk_samples, skew_hots, fk_ctx
+            ):
                 writer.writerow(row)
                 count += 1
 
-                # Reservoir sampling so child tables can sample FK values
-                # without keeping the whole table in memory.
+                if single_pk is not None and row[single_pk] in pin_targets:
+                    # Keep an independent copy (row dict is reused by reference).
+                    own_pinned[row[single_pk]] = dict(row)
+
+                # Reservoir sampling so child tables can sample random complete
+                # parent rows without keeping the whole table in memory.
                 if len(reservoir) < RESERVOIR_SIZE:
                     reservoir.append(row)
                 else:
@@ -913,6 +1323,32 @@ def generate_csv(sql_file: Union[str, Path], out_dir: Optional[Union[str, Path]]
                         reservoir[j] = row
 
         fk_samples[name] = reservoir
+        pinned_rows[name] = own_pinned
+
+        # Expose the parent's FULL PK domain to child FK sampling.
+        if single_pk is not None:
+            pk_col_of[name] = single_pk
+            if pk_is_autoincrement:
+                # Dense auto-increment range [start, start + count): compact and
+                # exact, covering every PK (not just the reservoir).
+                pk_domains[(name, single_pk)] = np.arange(
+                    pk_start, pk_start + count, dtype=np.int64
+                )
+            elif count <= RESERVOIR_SIZE:
+                pk_domains[(name, single_pk)] = [
+                    r[single_pk] for r in fk_samples[name]
+                ]
+            else:
+                # Non auto-inc PKs larger than the reservoir: read every PK back
+                # from the just-written file to build the exact full domain.
+                domain_vals: List[Any] = []
+                with open(
+                    output_dir / f"{name}.csv", "r", encoding="utf8"
+                ) as rf:
+                    rdr = csv.DictReader(rf)
+                    for r in rdr:
+                        domain_vals.append(r[single_pk])
+                pk_domains[(name, single_pk)] = domain_vals
 
         actual_bytes = (output_dir / f"{name}.csv").stat().st_size
         message = f"[Done] {name}.csv generated ({count} rows, {human_size(actual_bytes)})"
@@ -924,4 +1360,9 @@ def generate_csv(sql_file: Union[str, Path], out_dir: Optional[Union[str, Path]]
 
 
 if __name__ == "__main__":
-    generate_csv("create_table.sql")
+    if len(sys.argv) < 2:
+        print("Usage: python generator.py <input_sql_file> [output_dir]")
+        sys.exit(1)
+    input_file = sys.argv[1]
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else None
+    generate_csv(input_file, out_dir)
